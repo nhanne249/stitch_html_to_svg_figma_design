@@ -104,7 +104,7 @@ export type IconNode = BaseNode & {
 
 export type SimpleNode = BoxNode | TextNode | IconNode;
 
-const IGNORED_TAGS = new Set(['SCRIPT', 'STYLE', 'META', 'TITLE', 'LINK', 'NOSCRIPT']);
+const IGNORED_TAGS = new Set(['SCRIPT', 'STYLE', 'META', 'TITLE', 'LINK', 'NOSCRIPT', 'INPUT', 'TEXTAREA', 'SELECT', 'OPTION']);
 
 const PX_REGEX = /(-?\d+(?:\.\d+)?)px/;
 const RGBA_REGEX = /rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\)/i;
@@ -188,13 +188,25 @@ const createNodeFromElement = (
     const overflowHidden = style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden';
 
     const children: SimpleNode[] = [];
-    children.push(...collectTextNodes(element, style, rootRect));
+    const textNodes = collectTextNodes(element, style, rootRect);
+    children.push(...textNodes);
+
+    // Check if text was collected from inline children
+    // If so, skip processing those child elements to avoid duplication
+    const hasInlineChildren = Array.from(element.children).some(
+        (child) => child instanceof HTMLElement && ['inline', 'inline-block'].includes(window.getComputedStyle(child).display)
+    );
+    const textCollectedFromInline = hasInlineChildren && textNodes.length > 0;
 
     Array.from(element.children).forEach((child) => {
         if (!(child instanceof HTMLElement)) {
             return;
         }
         if (IGNORED_TAGS.has(child.tagName)) {
+            return;
+        }
+        // Skip inline children if we already collected their text via parent's innerText
+        if (textCollectedFromInline && ['inline', 'inline-block'].includes(window.getComputedStyle(child).display)) {
             return;
         }
         // Propagate the same hidden handling down the tree so the root's policy applies consistently.
@@ -282,6 +294,79 @@ const collectTextNodes = (element: HTMLElement, style: CSSStyleDeclaration, root
     const results: TextNode[] = [];
     const opacity = clampNumber(parseFloat(style.opacity), 1);
 
+    // Check if element has inline children - if so, use innerText to capture all text
+    const hasInlineChildren = Array.from(element.children).some(
+        (child) => child instanceof HTMLElement && ['inline', 'inline-block'].includes(window.getComputedStyle(child).display)
+    );
+
+    if (hasInlineChildren) {
+        // Clone element and remove icon children to get clean text
+        const clonedElement = element.cloneNode(true) as HTMLElement;
+        clonedElement.querySelectorAll('.material-symbols-outlined').forEach(icon => icon.remove());
+        
+        // Use innerText to get all visible text including from inline children (excluding icons)
+        const fullText = clonedElement.innerText?.replace(/\s+/g, ' ').trim();
+        if (!fullText) {
+            return results;
+        }
+
+        const { color, opacity: colorOpacity } = parseColor(style.color);
+        const fontSize = parsePx(style.fontSize, 16);
+        const fontFamily = sanitizeFontFamily(style.fontFamily);
+        const lineHeight = parseLineHeight(style.lineHeight, fontSize);
+        const letterSpacing = style.letterSpacing === 'normal' ? 0 : parsePx(style.letterSpacing, 0);
+        const textAnchor = toTextAnchor(style.textAlign);
+
+        // Get bounding rect of entire element text
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        const textRect = range.getBoundingClientRect();
+
+        if (textRect.width === 0 || textRect.height === 0) {
+            return results;
+        }
+
+        let xPos = textRect.left - rootRect.left;
+        if (textAnchor === 'middle') {
+            xPos = textRect.left - rootRect.left + textRect.width / 2;
+        } else if (textAnchor === 'end') {
+            xPos = textRect.right - rootRect.left;
+        }
+
+        const yPos = textRect.top - rootRect.top + fontSize * 0.8;
+
+        results.push({
+            id: `text-${nodeCounter++}`,
+            kind: 'text',
+            tagName: element.tagName.toLowerCase(),
+            x: xPos,
+            y: yPos,
+            width: textRect.width,
+            height: textRect.height,
+            opacity,
+            className: element.className || undefined,
+            text: {
+                content: fullText,
+                color,
+                opacity: colorOpacity,
+                fontFamily,
+                fontSize,
+                fontWeight: style.fontWeight,
+                fontStyle: style.fontStyle,
+                letterSpacing,
+                lineHeight,
+                textAnchor,
+            },
+            children: [],
+        });
+    }
+
+    // If we collected text from inline children, return early to avoid duplicates
+    if (hasInlineChildren && results.length > 0) {
+        return results;
+    }
+
+    // Normal case: collect individual text nodes
     Array.from(element.childNodes).forEach((node) => {
         if (node.nodeType !== Node.TEXT_NODE) {
             return;
@@ -313,11 +398,8 @@ const collectTextNodes = (element: HTMLElement, style: CSSStyleDeclaration, root
                 xPos = rect.right - rootRect.left;
             }
 
-            // Calculate baseline position using rect height and fontSize
-            // For alphabetic baseline: top + (lineHeight - fontSize) / 2 + fontSize * 0.85
-            const lineHeightPx = rect.height;
-            const baselineOffset = (lineHeightPx - fontSize) / 2 + fontSize * 0.85;
-            const yPos = rect.top - rootRect.top + baselineOffset;
+            // Adjust Y to account for baseline (add fontSize * 0.8 approximates ascent height)
+            const yPos = rect.top - rootRect.top + fontSize * 0.8;
 
             results.push({
                 id: `text-${nodeCounter++}`,
