@@ -65,7 +65,7 @@ export type TextPayload = {
 
 export type BaseNode = {
     id: string;
-    kind: 'box' | 'text';
+    kind: 'box' | 'text' | 'icon';
     x: number;
     y: number;
     width: number;
@@ -303,7 +303,7 @@ const collectTextNodes = (element: HTMLElement, style: CSSStyleDeclaration, root
         // Clone element and remove icon children to get clean text
         const clonedElement = element.cloneNode(true) as HTMLElement;
         clonedElement.querySelectorAll('.material-symbols-outlined').forEach(icon => icon.remove());
-        
+
         // Use innerText to get all visible text including from inline children (excluding icons)
         const fullText = clonedElement.innerText?.replace(/\s+/g, ' ').trim();
         if (!fullText) {
