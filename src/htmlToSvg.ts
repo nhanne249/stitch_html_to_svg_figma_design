@@ -65,7 +65,7 @@ export type TextPayload = {
 
 export type BaseNode = {
     id: string;
-    kind: 'box' | 'text' | 'icon';
+    kind: 'box' | 'text' | 'icon' | 'image';
     x: number;
     y: number;
     width: number;
@@ -78,6 +78,8 @@ export type BoxNode = BaseNode & {
     kind: 'box';
     tagName: string;
     background: Fill | null;
+    backgroundImage?: string; // URL for background-image
+    backgroundSize?: 'contain' | 'cover' | 'auto'; // object-fit equivalent
     borderRadius: BorderRadius;
     borders: BorderSet | null;
     shadows: BoxShadow[];
@@ -102,7 +104,17 @@ export type IconNode = BaseNode & {
     children: [];
 };
 
-export type SimpleNode = BoxNode | TextNode | IconNode;
+export type ImageNode = BaseNode & {
+    kind: 'image';
+    tagName: string;
+    src: string;
+    alt?: string;
+    objectFit: 'contain' | 'cover' | 'fill' | 'none';
+    borderRadius: BorderRadius;
+    children: [];
+};
+
+export type SimpleNode = BoxNode | TextNode | IconNode | ImageNode;
 
 const IGNORED_TAGS = new Set(['SCRIPT', 'STYLE', 'META', 'TITLE', 'LINK', 'NOSCRIPT', 'INPUT', 'TEXTAREA', 'SELECT', 'OPTION']);
 
@@ -113,6 +125,9 @@ const SHADOW_COLOR_REGEX = /(rgba?\([^)]*\)|hsla?\([^)]*\)|#[0-9a-f]{3,8}|[a-z]+
 
 let nodeCounter = 0;
 
+// Cache for converted images to avoid duplicate fetches
+const imageCache = new Map<string, Promise<string>>();
+
 type RgbaColor = {
     color: string;
     opacity: number;
@@ -122,13 +137,69 @@ type RenderContext = {
     defs: string[];
     gradientIndex: number;
     filterIndex: number;
+    imagePromises: Promise<void>[];
 };
 
 type HtmlToSvgOptions = {
     inlineCss?: string;
 };
 
-export const htmlToSvg = (rootElement: HTMLElement, options: HtmlToSvgOptions = {}): string => {
+// Convert image URL to base64 data URI
+const convertImageToBase64 = async (url: string): Promise<string> => {
+    // Check cache first
+    if (imageCache.has(url)) {
+        return imageCache.get(url)!;
+    }
+
+    const promise = (async () => {
+        try {
+            console.log(`🖼️ Fetching image: ${url.substring(0, 60)}...`);
+            // Fetch the image
+            const response = await fetch(url);
+            if (!response.ok) {
+                console.warn(`❌ Failed to fetch image: ${url} (${response.status})`);
+                return url; // Return original URL as fallback
+            }
+
+            // Get the blob
+            const blob = await response.blob();
+            console.log(`✅ Fetched ${blob.size} bytes, converting to base64...`);
+
+            // Convert to base64
+            return new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    const base64 = reader.result as string;
+                    console.log(`✅ Converted to base64 (${base64.length} chars)`);
+                    resolve(base64);
+                };
+                reader.onerror = () => {
+                    console.warn(`❌ Failed to convert image to base64: ${url}`);
+                    resolve(url); // Return original URL as fallback
+                };
+                reader.readAsDataURL(blob);
+            });
+        } catch (error) {
+            console.warn(`❌ Error converting image to base64: ${url}`, error);
+            return url; // Return original URL as fallback
+        }
+    })();
+
+    imageCache.set(url, promise);
+    return promise;
+};
+
+// Convert image URL to base64 if it's an external URL
+const maybeConvertImageUrl = async (url: string): Promise<string> => {
+    // Only convert external URLs (http/https)
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+        return convertImageToBase64(url);
+    }
+    // For data URIs and relative URLs, return as-is
+    return url;
+};
+
+export const htmlToSvg = async (rootElement: HTMLElement, options: HtmlToSvgOptions = {}): Promise<string> => {
     if (!rootElement) {
         throw new Error('A root element is required to generate SVG.');
     }
@@ -143,8 +214,11 @@ export const htmlToSvg = (rootElement: HTMLElement, options: HtmlToSvgOptions = 
         throw new Error('Unable to capture layout from the provided HTML.');
     }
 
-    const context: RenderContext = { defs: [], gradientIndex: 0, filterIndex: 0 };
-    const content = renderNode(simpleTree, context);
+    const context: RenderContext = { defs: [], gradientIndex: 0, filterIndex: 0, imagePromises: [] };
+    const content = await renderNode(simpleTree, context);
+
+    // Wait for all image conversions to complete
+    await Promise.all(context.imagePromises);
     const cssBlock = options.inlineCss?.trim();
     const styleDef = cssBlock ? createStyleDef(cssBlock) : null;
     const defsEntries = [...context.defs];
@@ -162,7 +236,7 @@ const createNodeFromElement = (
     element: HTMLElement,
     rootRect: DOMRect,
     allowHidden = false,
-): BoxNode | IconNode | null => {
+): BoxNode | IconNode | ImageNode | TextNode | null => {
     const rect = element.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) {
         return null;
@@ -178,6 +252,11 @@ const createNodeFromElement = (
         return createIconNode(element, style, rootRect);
     }
 
+    // Check if this is an IMG element (not background-image)
+    if (element.tagName.toLowerCase() === 'img') {
+        return createImageNode(element, style, rootRect);
+    }
+
     const id = element.id || `${element.tagName.toLowerCase()}-${nodeCounter++}`;
     const opacity = clampNumber(parseFloat(style.opacity), 1);
 
@@ -186,6 +265,22 @@ const createNodeFromElement = (
     const borders = parseBorders(style);
     const shadows = parseBoxShadows(style);
     const overflowHidden = style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden';
+
+    // Extract background-image URL if present
+    let backgroundImage: string | undefined;
+    let backgroundSize: 'contain' | 'cover' | 'auto' | undefined;
+    if (style.backgroundImage && style.backgroundImage !== 'none') {
+        const imageUrl = extractBackgroundImageUrl(style.backgroundImage);
+        if (imageUrl) {
+            backgroundImage = imageUrl;
+            const bgSize = style.backgroundSize;
+            if (bgSize === 'contain' || bgSize === 'cover') {
+                backgroundSize = bgSize;
+            } else {
+                backgroundSize = 'auto';
+            }
+        }
+    }
 
     const children: SimpleNode[] = [];
     const textNodes = collectTextNodes(element, style, rootRect);
@@ -227,6 +322,8 @@ const createNodeFromElement = (
         opacity,
         className: element.className || undefined,
         background,
+        backgroundImage,
+        backgroundSize,
         borderRadius,
         borders,
         shadows,
@@ -286,6 +383,73 @@ const createIconNode = (element: HTMLElement, style: CSSStyleDeclaration, rootRe
         color,
         svgPath: iconData.path,
         viewBox: iconData.viewBox,
+        children: [],
+    };
+};
+
+const extractBackgroundImageUrl = (backgroundImage: string): string | null => {
+    const urlMatch = backgroundImage.match(/url\(['"]?([^'"()]+)['"]?\)/);
+    return urlMatch ? urlMatch[1] : null;
+};
+
+const createImageNode = (element: HTMLElement, style: CSSStyleDeclaration, rootRect: DOMRect): ImageNode | null => {
+    // Check for background-image
+    let src: string | null = null;
+    let alt: string | undefined;
+
+    if (element.tagName.toLowerCase() === 'img') {
+        // <img> tag
+        src = element.getAttribute('src');
+        alt = element.getAttribute('alt') || undefined;
+    } else {
+        // Check for background-image in style
+        const bgImage = style.backgroundImage;
+        if (bgImage && bgImage !== 'none') {
+            src = extractBackgroundImageUrl(bgImage);
+        }
+    }
+
+    if (!src) {
+        return null;
+    }
+
+    const rect = element.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) {
+        return null;
+    }
+
+    // Parse object-fit
+    let objectFit: 'contain' | 'cover' | 'fill' | 'none' = 'fill';
+    const objectFitValue = style.objectFit;
+    if (objectFitValue === 'contain' || objectFitValue === 'cover' || objectFitValue === 'fill' || objectFitValue === 'none') {
+        objectFit = objectFitValue;
+    } else if (element.tagName.toLowerCase() !== 'img') {
+        // For background-image, check background-size
+        const bgSize = style.backgroundSize;
+        if (bgSize === 'contain') {
+            objectFit = 'contain';
+        } else if (bgSize === 'cover') {
+            objectFit = 'cover';
+        }
+    }
+
+    const opacity = clampNumber(parseFloat(style.opacity), 1);
+    const borderRadius = parseBorderRadius(style);
+
+    return {
+        id: `image-${nodeCounter++}`,
+        kind: 'image',
+        tagName: element.tagName.toLowerCase(),
+        x: rect.left - rootRect.left,
+        y: rect.top - rootRect.top,
+        width: rect.width,
+        height: rect.height,
+        opacity,
+        className: element.className || undefined,
+        src,
+        alt,
+        objectFit,
+        borderRadius,
         children: [],
     };
 };
@@ -398,8 +562,12 @@ const collectTextNodes = (element: HTMLElement, style: CSSStyleDeclaration, root
                 xPos = rect.right - rootRect.left;
             }
 
-            // Adjust Y to account for baseline (add fontSize * 0.8 approximates ascent height)
-            const yPos = rect.top - rootRect.top + fontSize * 0.8;
+            // Calculate baseline position: Use actual line height or fall back to fontSize-based approximation.
+            // For alphabetic baseline, we need the position where most letters sit.
+            // Typically this is about 75-80% down from the top of the line box.
+            const lineBoxHeight = rect.height > 0 ? rect.height : lineHeight;
+            const baselineOffset = lineBoxHeight * 0.75;
+            const yPos = rect.top - rootRect.top + baselineOffset;
 
             results.push({
                 id: `text-${nodeCounter++}`,
@@ -522,6 +690,18 @@ const isRenderable = (style: CSSStyleDeclaration): boolean => {
 
 const parseFill = (style: CSSStyleDeclaration): Fill | null => {
     if (style.backgroundImage && style.backgroundImage !== 'none') {
+        // Skip background-image with url() - those are handled by ImageNode
+        if (style.backgroundImage.includes('url(')) {
+            // If it's a url(), treat it as no fill (will be handled as ImageNode)
+            // But still check for gradients in case there's both
+            const gradient = parseLinearGradient(style.backgroundImage);
+            if (gradient) {
+                return gradient;
+            }
+            // Return null so we don't try to fill with the image URL
+            return null;
+        }
+
         const gradient = parseLinearGradient(style.backgroundImage);
         if (gradient) {
             return gradient;
@@ -899,14 +1079,17 @@ const toTextAnchor = (textAlign: string): 'start' | 'middle' | 'end' => {
     }
 };
 
-const renderNode = (node: SimpleNode, context: RenderContext): string => {
+const renderNode = async (node: SimpleNode, context: RenderContext): Promise<string> => {
     if (node.kind === 'text') {
         return renderTextNode(node);
     }
     if (node.kind === 'icon') {
         return renderIconNode(node);
     }
-    return renderBoxNode(node, context);
+    if (node.kind === 'image') {
+        return await renderImageNode(node, context);
+    }
+    return await renderBoxNode(node, context);
 };
 
 const createStyleDef = (css: string): string => {
@@ -914,7 +1097,7 @@ const createStyleDef = (css: string): string => {
     return `<style type="text/css"><![CDATA[${safeCss}]]></style>`;
 };
 
-const renderBoxNode = (node: BoxNode, context: RenderContext): string => {
+const renderBoxNode = async (node: BoxNode, context: RenderContext): Promise<string> => {
     const path = roundedRectPath(node.x, node.y, node.width, node.height, node.borderRadius);
     const fillAttr = resolveFill(node.background, context);
     const strokeAttr = resolveStroke(node.borders);
@@ -927,15 +1110,48 @@ const renderBoxNode = (node: BoxNode, context: RenderContext): string => {
     const clipId = node.overflowHidden ? ensureClipPath(node, context) : null;
     const clipAttr = clipId ? ` clip-path="url(#${clipId})"` : '';
 
-    const childrenContent = node.children.map((child) => renderNode(child, context)).join('');
+    const childrenContent = (await Promise.all(
+        node.children.map((child) => renderNode(child, context))
+    )).join('');
 
     const filterString = filterAttr ? ` filter="url(#${filterAttr})"` : '';
     const strokeString = strokeAttr ? ` ${strokeAttr}` : '';
 
     // Duplicate the class onto the shape so class-based selectors can target the geometry directly.
     const shapeClassAttr = node.className ? ` class="${escapeAttribute(node.className)}"` : '';
+
+    // Render background image if present
+    let backgroundImageContent = '';
+    if (node.backgroundImage) {
+        // Convert external URLs to base64 for Figma compatibility
+        const convertedImageUrl = await maybeConvertImageUrl(node.backgroundImage);
+
+        // Map background-size to preserveAspectRatio
+        let preserveAspectRatio = 'none'; // default for 'auto'
+        if (node.backgroundSize === 'contain') {
+            preserveAspectRatio = 'xMidYMid meet';
+        } else if (node.backgroundSize === 'cover') {
+            preserveAspectRatio = 'xMidYMid slice';
+        }
+
+        // Check if we need clip path for rounded corners
+        const hasRoundedCorners = node.borderRadius.topLeft > 0 || node.borderRadius.topRight > 0 ||
+            node.borderRadius.bottomRight > 0 || node.borderRadius.bottomLeft > 0;
+
+        let imgClipAttr = '';
+        if (hasRoundedCorners) {
+            const imgClipId = `imgclip-${context.filterIndex++}`;
+            const d = roundedRectPath(node.x, node.y, node.width, node.height, node.borderRadius);
+            context.defs.push(`<clipPath id="${imgClipId}" clipPathUnits="userSpaceOnUse"><path d="${d}" /></clipPath>`);
+            imgClipAttr = ` clip-path="url(#${imgClipId})"`;
+        }
+
+        backgroundImageContent = `<image x="${formatNumber(node.x)}" y="${formatNumber(node.y)}" width="${formatNumber(node.width)}" height="${formatNumber(node.height)}" href="${escapeAttribute(convertedImageUrl)}" preserveAspectRatio="${preserveAspectRatio}"${imgClipAttr} />`;
+    }
+
     return `<g${opacityAttr}${classAttr}${dataTagAttr}${clipAttr}>` +
         `<path d="${path}" fill="${fillAttr}"${strokeString}${filterString}${shapeClassAttr} />` +
+        `${backgroundImageContent}` +
         `${childrenContent}</g>`;
 };
 
@@ -973,6 +1189,45 @@ const renderIconNode = (node: IconNode): string => {
     const offsetY = node.y + (node.height - scaledHeight) / 2;
 
     return `<g transform="translate(${formatNumber(offsetX)},${formatNumber(offsetY)}) scale(${formatNumber(scale)})"${opacityAttr}${classAttr}${dataTagAttr}${dataIconAttr}><path d="${node.svgPath}" fill="${node.color}"/></g>`;
+};
+
+const renderImageNode = async (node: ImageNode, context: RenderContext): Promise<string> => {
+    const opacityAttr = node.opacity !== 1 ? ` opacity="${formatNumber(node.opacity)}"` : '';
+    const classAttr = node.className ? ` class="${escapeAttribute(node.className)}"` : '';
+    const dataTagAttr = ` data-tag="${escapeAttribute(node.tagName)}"`;
+    const dataAltAttr = node.alt ? ` data-alt="${escapeAttribute(node.alt)}"` : '';
+
+    // Convert external URLs to base64 for Figma compatibility
+    const convertedSrc = await maybeConvertImageUrl(node.src);
+
+    // Map object-fit to preserveAspectRatio
+    let preserveAspectRatio = 'xMidYMid meet'; // default for 'contain'
+    if (node.objectFit === 'cover') {
+        preserveAspectRatio = 'xMidYMid slice';
+    } else if (node.objectFit === 'fill') {
+        preserveAspectRatio = 'none';
+    } else if (node.objectFit === 'none') {
+        preserveAspectRatio = 'none';
+    }
+
+    // Check if we need clip path for rounded corners
+    const hasRoundedCorners = node.borderRadius.topLeft > 0 || node.borderRadius.topRight > 0 ||
+        node.borderRadius.bottomRight > 0 || node.borderRadius.bottomLeft > 0;
+
+    let clipPathAttr = '';
+    if (hasRoundedCorners) {
+        const clipId = ensureImageClipPath(node, context);
+        clipPathAttr = ` clip-path="url(#${clipId})"`;
+    }
+
+    return `<image x="${formatNumber(node.x)}" y="${formatNumber(node.y)}" width="${formatNumber(node.width)}" height="${formatNumber(node.height)}" href="${escapeAttribute(convertedSrc)}" preserveAspectRatio="${preserveAspectRatio}"${opacityAttr}${classAttr}${dataTagAttr}${dataAltAttr}${clipPathAttr} />`;
+};
+
+const ensureImageClipPath = (node: ImageNode, context: RenderContext): string => {
+    const id = `imgclip-${context.filterIndex++}`;
+    const d = roundedRectPath(node.x, node.y, node.width, node.height, node.borderRadius);
+    context.defs.push(`<clipPath id="${id}" clipPathUnits="userSpaceOnUse"><path d="${d}" /></clipPath>`);
+    return id;
 };
 
 const resolveFill = (fill: Fill | null, context: RenderContext): string => {

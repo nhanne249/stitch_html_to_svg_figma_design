@@ -294,7 +294,7 @@ const App = () => {
                 if (!hasLayoutBox(rootElement)) {
                     throw new Error('Root element has no measurable layout');
                 }
-                const svgString = htmlToSvg(rootElement, { inlineCss: collectedCss });
+                const svgString = await htmlToSvg(rootElement, { inlineCss: collectedCss });
                 setSvgOutput(svgString);
 
                 if (shouldCopy) {
